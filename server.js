@@ -257,3 +257,11 @@ wss.on("close", () => clearInterval(interval));
 /** -------------------- Boot -------------------- */
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log("listening on", PORT));
+Index.html
+Updated Host panel to use role counts (number inputs) instead of checkboxes.
+The “Start Game” button is auto-disabled until total selected roles = current players (so you don’t accidentally under/over-assign).
+Default WS URL points to Render.
+
+html
+Copy
+Edit
