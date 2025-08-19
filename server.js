@@ -1,11 +1,10 @@
-// server.js — Mafia WS Server (Rooms + Login Flow + Role Deal + Host Panel)
+// server.js — Mafia WS Server (Rooms + Login/Host/Guest + Role Counts)
 
 import http from "http";
 import { WebSocketServer } from "ws";
 import { v4 as uuidv4 } from "uuid";
 
-/** -------------------- State -------------------- */
-const rooms = new Map(); // roomId -> room
+/** -------------------- Constants & State -------------------- */
 const ROLE_CATALOG = [
   "pablo",
   "martinez",
@@ -14,8 +13,10 @@ const ROLE_CATALOG = [
   "doctor",
   "moreno",
   "benaparte",
-  "citizen"
+  "citizen",
 ];
+
+const rooms = new Map(); // roomId -> room
 
 /** -------------------- Utils -------------------- */
 const send = (ws, type, payload = {}) => {
@@ -23,13 +24,10 @@ const send = (ws, type, payload = {}) => {
 };
 
 const broadcast = (room, type, payload = {}) => {
-  for (const client of room.clients) {
-    send(client, type, payload);
-  }
+  for (const client of room.clients) send(client, type, payload);
 };
 
-const genRoomId = () =>
-  Math.random().toString(36).slice(2, 8).toUpperCase();
+const genRoomId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
 
 const shuffle = (arr) => {
   const a = [...arr];
@@ -48,41 +46,38 @@ const roomState = (room) => ({
   peers: Array.from(room.peers.values()).map((p) => ({
     id: p.id,
     name: p.name || "—",
-    alive: !!p.alive
-    // مهم: role رو در استیت عمومی نمی‌فرستیم که لو نره
+    alive: !!p.alive,
   })),
   settings: {
     maxPlayers: room.settings.maxPlayers,
     roleCatalog: room.settings.roleCatalog,
-    enabledRoles: room.settings.enabledRoles
-  }
+    roleCounts: room.settings.roleCounts, // <-- NEW
+  },
 });
 
 const leaveRoom = (ws) => {
   if (!ws.roomId) return;
   const room = rooms.get(ws.roomId);
-  if (!room) { ws.roomId = null; return; }
+  ws.roomId = null;
+  if (!room) return;
+
   room.clients.delete(ws);
   room.peers.delete(ws.id);
 
-  // اگر هاست رفت، هاست جدید تعیین کن
+  // If host left, promote first remaining peer as host
   if (room.hostId === ws.id) {
-    const left = Array.from(room.peers.keys());
-    room.hostId = left[0] || null;
+    const remaining = Array.from(room.peers.keys());
+    room.hostId = remaining[0] || null;
   }
 
   broadcast(room, "PEER_LEFT", { id: ws.id });
   broadcast(room, "ROOM_STATE", roomState(room));
 
-  // اگر روم خالی شد پاکش کن
   if (room.clients.size === 0) rooms.delete(room.id);
-  ws.roomId = null;
 };
 
-/** -------------------- Server -------------------- */
-const server = http.createServer((req, res) => {
-  res.writeHead(200).end("Mafia WS OK");
-});
+/** -------------------- HTTP + WS -------------------- */
+const server = http.createServer((_, res) => res.writeHead(200).end("Mafia WS OK"));
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
@@ -99,8 +94,13 @@ wss.on("connection", (ws) => {
 
     // -------------------- CREATE_ROOM (Host) --------------------
     if (type === "CREATE_ROOM") {
-      // اگر توی روم دیگه‌ای هست، اول خارجش کن
       leaveRoom(ws);
+
+      // default role counts (host can change in UI)
+      const defaultCounts = {};
+      ROLE_CATALOG.forEach((r) => (defaultCounts[r] = 0));
+      // give a sane default: 1 citizen (others 0)
+      defaultCounts.citizen = 1;
 
       const id = genRoomId();
       const room = {
@@ -109,24 +109,17 @@ wss.on("connection", (ws) => {
         phase: "lobby",
         day: 0,
         clients: new Set(),
-        peers: new Map(), // id -> {id, ws, name, role, alive}
+        peers: new Map(), // id -> { id, ws, name, role, alive }
         settings: {
           maxPlayers: 11,
           roleCatalog: [...ROLE_CATALOG],
-          enabledRoles: [...ROLE_CATALOG]
-        }
+          roleCounts: defaultCounts, // <-- NEW
+        },
       };
       rooms.set(id, room);
 
-      // اضافه کردن هاست به روم
       room.clients.add(ws);
-      room.peers.set(ws.id, {
-        id: ws.id,
-        ws,
-        name: ws.name || "Host",
-        role: null,
-        alive: false
-      });
+      room.peers.set(ws.id, { id: ws.id, ws, name: ws.name || "Host", role: null, alive: false });
       ws.roomId = id;
 
       send(ws, "ROOM_CREATED", { roomId: id, hostId: room.hostId });
@@ -136,26 +129,16 @@ wss.on("connection", (ws) => {
 
     // -------------------- JOIN_ROOM (Guest) --------------------
     if (type === "JOIN_ROOM") {
-      const { roomId } = payload || {};
-      const room = rooms.get(String(roomId || "").toUpperCase());
+      const roomId = String(payload.roomId || "").toUpperCase();
+      const room = rooms.get(roomId);
       if (!room) return send(ws, "ERROR", { message: "ROOM_NOT_FOUND" });
 
-      // ظرفیت
-      if (room.clients.size >= room.settings.maxPlayers) {
+      if (room.clients.size >= room.settings.maxPlayers)
         return send(ws, "ERROR", { message: "ROOM_IS_FULL" });
-      }
 
-      // اگر توی یه روم دیگه‌ای، خارج شو
       leaveRoom(ws);
-
       room.clients.add(ws);
-      room.peers.set(ws.id, {
-        id: ws.id,
-        ws,
-        name: ws.name || "Guest",
-        role: null,
-        alive: false
-      });
+      room.peers.set(ws.id, { id: ws.id, ws, name: ws.name || "Guest", role: null, alive: false });
       ws.roomId = room.id;
 
       send(ws, "JOINED", { roomId: room.id, hostId: room.hostId });
@@ -168,6 +151,7 @@ wss.on("connection", (ws) => {
     if (type === "SET_NAME") {
       const name = (payload?.name || "").toString().slice(0, 24).trim();
       ws.name = name || ws.name || null;
+
       if (ws.roomId) {
         const room = rooms.get(ws.roomId);
         const peer = room?.peers.get(ws.id);
@@ -184,26 +168,36 @@ wss.on("connection", (ws) => {
       const room = rooms.get(ws.roomId);
       if (!room) return;
       if (room.hostId !== ws.id) return send(ws, "ERROR", { message: "ONLY_HOST" });
+
       const n = Number(payload.maxPlayers);
       if (Number.isFinite(n)) room.settings.maxPlayers = Math.max(3, Math.min(20, n));
+
       broadcast(room, "ROOM_STATE", roomState(room));
       return;
     }
 
-    // -------------------- UPDATE_ROLE_POOL (Host only) --------------------
-    if (type === "UPDATE_ROLE_POOL") {
+    // -------------------- UPDATE_ROLE_COUNTS (Host only) --------------------
+    // payload.counts: { [role]: number >= 0 }
+    if (type === "UPDATE_ROLE_COUNTS") {
       const room = rooms.get(ws.roomId);
       if (!room) return;
       if (room.hostId !== ws.id) return send(ws, "ERROR", { message: "ONLY_HOST" });
 
-      const input = Array.isArray(payload.enabledRoles) ? payload.enabledRoles.map(String) : [];
-      // whitelist + unique + حفظ ترتیب طبق کاتالوگ
+      const counts = payload?.counts || {};
+      const next = {};
       const catalogSet = new Set(room.settings.roleCatalog);
-      const filtered = [];
-      input.forEach(r => { if (catalogSet.has(r) && !filtered.includes(r)) filtered.push(r); });
-      if (filtered.length < 3) return send(ws, "ERROR", { message: "ROLE_POOL_TOO_SMALL" });
+      for (const r of Object.keys(counts)) {
+        if (!catalogSet.has(r)) continue;
+        let v = Number(counts[r]);
+        if (!Number.isFinite(v) || v < 0) v = 0;
+        next[r] = Math.min(50, Math.floor(v)); // cap to 50 to avoid nonsense
+      }
+      // ensure every catalog role has a number
+      room.settings.roleCatalog.forEach((r) => {
+        if (!(r in next)) next[r] = 0;
+      });
 
-      room.settings.enabledRoles = filtered;
+      room.settings.roleCounts = next;
       broadcast(room, "ROOM_STATE", roomState(room));
       return;
     }
@@ -218,14 +212,22 @@ wss.on("connection", (ws) => {
       const peers = Array.from(room.peers.values());
       if (peers.length < 3) return send(ws, "ERROR", { message: "NEED_AT_LEAST_3_PLAYERS" });
 
-      // pool = enabledRoles + padding با citizen تا تعداد بازیکن‌ها
-      let base = [...room.settings.enabledRoles];
-      let pool = shuffle(base);
+      const counts = room.settings.roleCounts || {};
+      // Build role pool by counts
+      let pool = [];
+      room.settings.roleCatalog.forEach((r) => {
+        const c = Math.max(0, Number(counts[r] || 0));
+        for (let i = 0; i < c; i++) pool.push(r);
+      });
+
+      // Fallbacks: pad with citizens or trim
+      if (pool.length === 0) pool.push("citizen");
       while (pool.length < peers.length) pool.push("citizen");
-      const roles = shuffle(pool).slice(0, peers.length);
+
+      pool = shuffle(pool).slice(0, peers.length);
 
       peers.forEach((p, i) => {
-        p.role = roles[i];
+        p.role = pool[i];
         p.alive = true;
         send(p.ws, "PRIVATE_ROLE", { role: p.role });
       });
@@ -237,7 +239,7 @@ wss.on("connection", (ws) => {
     }
 
     // -------------------- PING --------------------
-    if (type === "PING") { send(ws, "PONG", {}); return; }
+    if (type === "PING") return send(ws, "PONG", {});
   });
 
   ws.on("close", () => leaveRoom(ws));
@@ -250,7 +252,6 @@ const interval = setInterval(() => {
     ws.isAlive = false; ws.ping();
   });
 }, 30000);
-
 wss.on("close", () => clearInterval(interval));
 
 /** -------------------- Boot -------------------- */
